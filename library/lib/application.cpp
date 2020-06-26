@@ -21,32 +21,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <math.h>
+
+#include <nanovg.h>
+#include <nanovg_dk.h>
 
 #include <algorithm>
 #include <borealis.hpp>
 #include <string>
 
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#include <glad.h>
-
-#define GLM_FORCE_PURE
-#define GLM_ENABLE_EXPERIMENTAL
-#include <nanovg.h>
-
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
-#include <glm/gtx/rotate_vector.hpp>
-#include <glm/mat4x4.hpp>
-#include <glm/vec3.hpp>
-#include <glm/vec4.hpp>
-#define NANOVG_GL3_IMPLEMENTATION
-#define USE_OPENGL
-#include <nanovg_gl.h>
-
-#ifdef __SWITCH__
 #include <switch.h>
-#endif
 
 #include <chrono>
 #include <set>
@@ -61,77 +45,196 @@ constexpr uint32_t WINDOW_HEIGHT = 720;
 #define BUTTON_REPEAT_DELAY 15
 #define BUTTON_REPEAT_CADENCY 5
 
-// glfw code from the glfw hybrid app by fincs
-// https://github.com/fincs/hybrid_app
+class DkTest final
+{
+    static constexpr unsigned NumFramebuffers = 2;
+    static constexpr uint32_t FramebufferWidth = 1280;
+    static constexpr uint32_t FramebufferHeight = 720;
+    static constexpr unsigned StaticCmdSize = 0x1000;
 
+    dk::UniqueDevice device;
+    dk::UniqueQueue queue;
+
+    std::optional<CMemPool> pool_images;
+    std::optional<CMemPool> pool_code;
+    std::optional<CMemPool> pool_data;
+
+    dk::UniqueCmdBuf cmdbuf;
+
+    CMemPool::Handle depthBuffer_mem;
+    CMemPool::Handle framebuffers_mem[NumFramebuffers];
+
+    dk::Image depthBuffer;
+    dk::Image framebuffers[NumFramebuffers];
+    DkCmdList framebuffer_cmdlists[NumFramebuffers];
+    dk::UniqueSwapchain swapchain;
+
+    DkCmdList render_cmdlist;
+
+    std::optional<nvg::DkRenderer> renderer;
+    NVGcontext* vg;
+
+    int slot = -1;
+
+public:
+    DkTest()
+    {
+        // Create the deko3d device
+        device = dk::DeviceMaker{}.create();
+
+        // Create the main queue
+        queue = dk::QueueMaker{device}.setFlags(DkQueueFlags_Graphics).create();
+
+        // Create the memory pools
+        pool_images.emplace(device, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, 16*1024*1024);
+        pool_code.emplace(device, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code, 128*1024);
+        pool_data.emplace(device, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, 1*1024*1024);
+
+        // Create the static command buffer and feed it freshly allocated memory
+        cmdbuf = dk::CmdBufMaker{device}.create();
+        CMemPool::Handle cmdmem = pool_data->allocate(StaticCmdSize);
+        cmdbuf.addMemory(cmdmem.getMemBlock(), cmdmem.getOffset(), cmdmem.getSize());
+
+        // Create the framebuffer resources
+        createFramebufferResources();
+
+        this->renderer.emplace(FramebufferWidth, FramebufferHeight, this->device, this->queue, *this->pool_images, *this->pool_code, *this->pool_data);
+        this->vg = nvgCreateDk(&*this->renderer, NVG_ANTIALIAS | NVG_STENCIL_STROKES);
+    }
+
+    ~DkTest()
+    {
+        // Cleanup vg. This needs to be done first as it relies on the renderer.
+        nvgDeleteDk(vg);
+
+        // Destroy the renderer
+        this->renderer.reset();
+
+        // Destroy the framebuffer resources
+        destroyFramebufferResources();
+    }
+
+    void createFramebufferResources()
+    {
+      // Create layout for the depth buffer
+        dk::ImageLayout layout_depthbuffer;
+        dk::ImageLayoutMaker{device}
+            .setFlags(DkImageFlags_UsageRender | DkImageFlags_HwCompression)
+            .setFormat(DkImageFormat_S8)
+            .setDimensions(FramebufferWidth, FramebufferHeight)
+            .initialize(layout_depthbuffer);
+
+        // Create the depth buffer
+        depthBuffer_mem = pool_images->allocate(layout_depthbuffer.getSize(), layout_depthbuffer.getAlignment());
+        depthBuffer.initialize(layout_depthbuffer, depthBuffer_mem.getMemBlock(), depthBuffer_mem.getOffset());
+
+        // Create layout for the framebuffers
+        dk::ImageLayout layout_framebuffer;
+        dk::ImageLayoutMaker{device}
+            .setFlags(DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression)
+            .setFormat(DkImageFormat_RGBA8_Unorm)
+            .setDimensions(FramebufferWidth, FramebufferHeight)
+            .initialize(layout_framebuffer);
+
+        // Create the framebuffers
+        std::array<DkImage const*, NumFramebuffers> fb_array;
+        uint64_t fb_size  = layout_framebuffer.getSize();
+        uint32_t fb_align = layout_framebuffer.getAlignment();
+        for (unsigned i = 0; i < NumFramebuffers; i ++)
+        {
+            // Allocate a framebuffer
+            framebuffers_mem[i] = pool_images->allocate(fb_size, fb_align);
+            framebuffers[i].initialize(layout_framebuffer, framebuffers_mem[i].getMemBlock(), framebuffers_mem[i].getOffset());
+
+            // Generate a command list that binds it
+            dk::ImageView colorTarget{ framebuffers[i] }, depthTarget{ depthBuffer };
+            cmdbuf.bindRenderTargets(&colorTarget, &depthTarget);
+            framebuffer_cmdlists[i] = cmdbuf.finishList();
+
+            // Fill in the array for use later by the swapchain creation code
+            fb_array[i] = &framebuffers[i];
+        }
+
+        // Create the swapchain using the framebuffers
+        swapchain = dk::SwapchainMaker{device, nwindowGetDefault(), fb_array}.create();
+
+        // Generate the main rendering cmdlist
+        recordStaticCommands();
+    }
+
+    void destroyFramebufferResources()
+    {
+        // Return early if we have nothing to destroy
+        if (!swapchain) return;
+
+        // Make sure the queue is idle before destroying anything
+        queue.waitIdle();
+
+        // Clear the static cmdbuf, destroying the static cmdlists in the process
+        cmdbuf.clear();
+
+        // Destroy the swapchain
+        swapchain.destroy();
+
+        // Destroy the framebuffers
+        for (unsigned i = 0; i < NumFramebuffers; i ++)
+            framebuffers_mem[i].destroy();
+
+        // Destroy the depth buffer
+        depthBuffer_mem.destroy();
+    }
+
+    void recordStaticCommands()
+    {
+        // Initialize state structs with deko3d defaults
+        dk::RasterizerState rasterizerState;
+        dk::ColorState colorState;
+        dk::ColorWriteState colorWriteState;
+        dk::BlendState blendState;
+
+        // Configure the viewport and scissor
+        cmdbuf.setViewports(0, { { 0.0f, 0.0f, FramebufferWidth, FramebufferHeight, 0.0f, 1.0f } });
+        cmdbuf.setScissors(0, { { 0, 0, FramebufferWidth, FramebufferHeight } });
+
+        // Clear the color and depth buffers
+        cmdbuf.clearColor(0, DkColorMask_RGBA, 0.2f, 0.3f, 0.3f, 1.0f);
+        cmdbuf.clearDepthStencil(true, 1.0f, 0xFF, 0);
+
+        // Bind required state
+        cmdbuf.bindRasterizerState(rasterizerState);
+        cmdbuf.bindColorState(colorState);
+        cmdbuf.bindColorWriteState(colorWriteState);
+
+        render_cmdlist = cmdbuf.finishList();
+    }
+
+    void beginRender()
+    {
+        // Acquire a framebuffer from the swapchain (and wait for it to be available)
+        this->slot = queue.acquireImage(swapchain);
+
+        // Run the command list that attaches said framebuffer to the queue
+        queue.submitCommands(framebuffer_cmdlists[slot]);
+
+        // Run the main rendering command list
+        queue.submitCommands(render_cmdlist);
+    }
+
+    void endRender()
+    {
+        // Now that we are done rendering, present it to the screen
+        queue.presentImage(swapchain, slot);
+    }
+
+    NVGcontext *getNvgContext()
+    {
+        return this->vg;
+    }
+};
 namespace brls
 {
 
-// TODO: Use this instead of a glViewport each frame
-static void windowFramebufferSizeCallback(GLFWwindow* window, int width, int height)
-{
-    if (!width || !height)
-        return;
-
-    glViewport(0, 0, width, height);
-    Application::windowScale = (float)width / (float)WINDOW_WIDTH;
-
-    float contentHeight = ((float)height / (Application::windowScale * (float)WINDOW_HEIGHT)) * (float)WINDOW_HEIGHT;
-
-    Application::contentWidth  = WINDOW_WIDTH;
-    Application::contentHeight = (unsigned)roundf(contentHeight);
-
-    Application::resizeNotificationManager();
-
-    Logger::info("Window size changed to %dx%d", width, height);
-    Logger::info("New scale factor is %f", Application::windowScale);
-}
-
-static void joystickCallback(int jid, int event)
-{
-    if (event == GLFW_CONNECTED)
-    {
-        Logger::info("Joystick %d connected", jid);
-        if (glfwJoystickIsGamepad(jid))
-            Logger::info("Joystick %d is gamepad: \"%s\"", jid, glfwGetGamepadName(jid));
-    }
-    else if (event == GLFW_DISCONNECTED)
-        Logger::info("Joystick %d disconnected", jid);
-}
-
-static void errorCallback(int errorCode, const char* description)
-{
-    Logger::error("[GLFW:%d] %s", errorCode, description);
-}
-
-static void windowKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
-{
-    if (action == GLFW_PRESS)
-    {
-        // Check for toggle-fullscreen combo
-        if (key == GLFW_KEY_ENTER && mods == GLFW_MOD_ALT)
-        {
-            static int saved_x, saved_y, saved_width, saved_height;
-
-            if (!glfwGetWindowMonitor(window))
-            {
-                // Back up window position/size
-                glfwGetWindowPos(window, &saved_x, &saved_y);
-                glfwGetWindowSize(window, &saved_width, &saved_height);
-
-                // Switch to fullscreen mode
-                GLFWmonitor* monitor    = glfwGetPrimaryMonitor();
-                const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-                glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
-            }
-            else
-            {
-                // Switch back to windowed mode
-                glfwSetWindowMonitor(window, nullptr, saved_x, saved_y, saved_width, saved_height, GLFW_DONT_CARE);
-            }
-        }
-    }
-}
+    DkTest dk;
 
 bool Application::init(std::string title)
 {
@@ -150,78 +253,21 @@ bool Application::init(std::string title, Style style, Theme theme)
     // Init static variables
     Application::currentStyle = style;
     Application::currentFocus = nullptr;
-    Application::oldGamepad   = {};
-    Application::gamepad      = {};
     Application::title        = title;
 
     // Init theme to defaults
     Application::setTheme(theme);
 
-    // Init glfw
-    glfwSetErrorCallback(errorCallback);
-    glfwInitHint(GLFW_JOYSTICK_HAT_BUTTONS, GLFW_FALSE);
-    if (!glfwInit())
-    {
-        Logger::error("Failed to initialize glfw");
-        return false;
-    }
+    Application::windowScale = 1.0f;
 
-    // Create window
-#ifdef __APPLE__
-    // Explicitly ask for a 3.2 context on OS X
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    // Force scaling off to keep desired framebuffer size
-    glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_FALSE);
-#else
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-#endif
+    float contentHeight = ((float)WINDOW_HEIGHT / (Application::windowScale * (float)WINDOW_HEIGHT)) * (float)WINDOW_HEIGHT;
 
-    Application::window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, title.c_str(), nullptr, nullptr);
-    if (!window)
-    {
-        Logger::error("glfw: failed to create window\n");
-        glfwTerminate();
-        return false;
-    }
+    Application::vg = dk.getNvgContext();
 
-    // Configure window
-    glfwSetInputMode(window, GLFW_STICKY_KEYS, GLFW_TRUE);
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, windowFramebufferSizeCallback);
-    glfwSetKeyCallback(window, windowKeyCallback);
-    glfwSetJoystickCallback(joystickCallback);
+    Application::contentWidth  = WINDOW_WIDTH;
+    Application::contentHeight = (unsigned)roundf(contentHeight);
 
-    // Load OpenGL routines using glad
-    gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
-    glfwSwapInterval(1);
-
-    Logger::info("GL Vendor: %s", glGetString(GL_VENDOR));
-    Logger::info("GL Renderer: %s", glGetString(GL_RENDERER));
-    Logger::info("GL Version: %s", glGetString(GL_VERSION));
-
-    if (glfwJoystickIsGamepad(GLFW_JOYSTICK_1))
-    {
-        GLFWgamepadstate state;
-        Logger::info("Gamepad detected: %s", glfwGetGamepadName(GLFW_JOYSTICK_1));
-        glfwGetGamepadState(GLFW_JOYSTICK_1, &state);
-    }
-
-    // Initialize the scene
-    Application::vg = nvgCreateGL3(NVG_STENCIL_STROKES | NVG_ANTIALIAS);
-    if (!vg)
-    {
-        Logger::error("Unable to init nanovg");
-        glfwTerminate();
-        return false;
-    }
-
-    windowFramebufferSizeCallback(window, WINDOW_WIDTH, WINDOW_HEIGHT);
-    glfwSetTime(0.0);
+    Application::resizeNotificationManager();
 
     // Load fonts
 #ifdef __SWITCH__
@@ -307,12 +353,8 @@ bool Application::init(std::string title, Style style, Theme theme)
         Application::currentThemeVariant = ThemeVariant_LIGHT;
 #endif
 
-    // Init window size
-    GLint viewport[4];
-    glGetIntegerv(GL_VIEWPORT, viewport);
-
-    Application::windowWidth  = viewport[2];
-    Application::windowHeight = viewport[3];
+    Application::windowWidth  = WINDOW_WIDTH;
+    Application::windowHeight = WINDOW_HEIGHT;
 
     // Init animations engine
     menu_animation_init();
@@ -330,46 +372,10 @@ bool Application::mainLoop()
     if (Application::frameTime > 0.0f)
         frameStart = cpu_features_get_time_usec();
 
-    // glfw events
-    bool is_active;
-    do
-    {
-        is_active = !glfwGetWindowAttrib(Application::window, GLFW_ICONIFIED);
-        if (is_active)
-            glfwPollEvents();
-        else
-            glfwWaitEvents();
-
-        if (glfwWindowShouldClose(Application::window))
-        {
-            Application::exit();
-            return false;
-        }
-    } while (!is_active);
-
-    // libnx applet main loop
-#ifdef __SWITCH__
     if (!appletMainLoop())
     {
         Application::exit();
         return false;
-    }
-#endif
-
-    // Gamepad
-    if (!glfwGetGamepadState(GLFW_JOYSTICK_1, &Application::gamepad))
-    {
-        // Keyboard -> DPAD Mapping
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_DPAD_LEFT]    = glfwGetKey(window, GLFW_KEY_LEFT);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_DPAD_RIGHT]   = glfwGetKey(window, GLFW_KEY_RIGHT);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP]      = glfwGetKey(window, GLFW_KEY_UP);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_DPAD_DOWN]    = glfwGetKey(window, GLFW_KEY_DOWN);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_START]        = glfwGetKey(window, GLFW_KEY_ESCAPE);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_BACK]         = glfwGetKey(window, GLFW_KEY_F1);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_A]            = glfwGetKey(window, GLFW_KEY_ENTER);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_B]            = glfwGetKey(window, GLFW_KEY_BACKSPACE);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER]  = glfwGetKey(window, GLFW_KEY_L);
-        Application::gamepad.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER] = glfwGetKey(window, GLFW_KEY_R);
     }
 
     // Trigger gamepad events
@@ -380,20 +386,9 @@ bool Application::mainLoop()
     static retro_time_t buttonPressTime = 0;
     static int repeatingButtonTimer     = 0;
 
-    for (int i = GLFW_GAMEPAD_BUTTON_A; i <= GLFW_GAMEPAD_BUTTON_LAST; i++)
-    {
-        if (Application::gamepad.buttons[i] == GLFW_PRESS)
-        {
-            anyButtonPressed = true;
-            repeating        = (repeatingButtonTimer > BUTTON_REPEAT_DELAY && repeatingButtonTimer % BUTTON_REPEAT_CADENCY == 0);
-
-            if (Application::oldGamepad.buttons[i] != GLFW_PRESS || repeating)
-                Application::onGamepadButtonPressed(i, repeating);
-        }
-
-        if (Application::gamepad.buttons[i] != Application::oldGamepad.buttons[i])
-            buttonPressTime = repeatingButtonTimer = 0;
-    }
+    hidScanInput();
+    u64 kDown = hidKeysDown(CONTROLLER_P1_AUTO);
+    Application::onGamepadButtonPressed(kDown, repeating);
 
     if (anyButtonPressed && cpu_features_get_time_usec() - buttonPressTime > 1000)
     {
@@ -401,20 +396,9 @@ bool Application::mainLoop()
         repeatingButtonTimer++; // Increased once every ~1ms
     }
 
-    Application::oldGamepad = Application::gamepad;
-
-    // Handle window size changes
-    GLint viewport[4];
-    glGetIntegerv(GL_VIEWPORT, viewport);
-
-    unsigned newWidth  = viewport[2];
-    unsigned newHeight = viewport[3];
-
-    if (Application::windowWidth != newWidth || Application::windowHeight != newHeight)
-    {
-        Application::windowWidth  = newWidth;
-        Application::windowHeight = newHeight;
-        Application::onWindowSizeChanged();
+    if (kDown & KEY_PLUS) {
+        Application::exit();
+        return false;
     }
 
     // Animations
@@ -425,7 +409,6 @@ bool Application::mainLoop()
 
     // Render
     Application::frame();
-    glfwSwapBuffers(window);
 
     // Sleep if necessary
     if (Application::frameTime > 0.0f)
@@ -445,7 +428,7 @@ bool Application::mainLoop()
 
 void Application::quit()
 {
-    glfwSetWindowShouldClose(window, GLFW_TRUE);
+
 }
 
 void Application::navigate(FocusDirection direction)
@@ -480,7 +463,7 @@ void Application::navigate(FocusDirection direction)
     Application::giveFocus(nextFocus);
 }
 
-void Application::onGamepadButtonPressed(char button, bool repeating)
+void Application::onGamepadButtonPressed(u64 button, bool repeating)
 {
     if (Application::blockInputsTokens != 0)
         return;
@@ -497,22 +480,14 @@ void Application::onGamepadButtonPressed(char button, bool repeating)
     // Navigation
     // Only navigate if the button hasn't been consumed by an action
     // (allows overriding DPAD buttons using actions)
-    switch (button)
-    {
-        case GLFW_GAMEPAD_BUTTON_DPAD_DOWN:
-            Application::navigate(FocusDirection::DOWN);
-            break;
-        case GLFW_GAMEPAD_BUTTON_DPAD_UP:
-            Application::navigate(FocusDirection::UP);
-            break;
-        case GLFW_GAMEPAD_BUTTON_DPAD_LEFT:
-            Application::navigate(FocusDirection::LEFT);
-            break;
-        case GLFW_GAMEPAD_BUTTON_DPAD_RIGHT:
-            Application::navigate(FocusDirection::RIGHT);
-            break;
-        default:
-            break;
+    if (button & KEY_DDOWN) {
+        Application::navigate(FocusDirection::DOWN);
+    } else if (button & KEY_DUP) {
+        Application::navigate(FocusDirection::UP);
+    } else if (button & KEY_DLEFT) {
+        Application::navigate(FocusDirection::LEFT);
+    } else if (button & KEY_DRIGHT) {
+        Application::navigate(FocusDirection::RIGHT);
     }
 }
 
@@ -521,7 +496,7 @@ View* Application::getCurrentFocus()
     return Application::currentFocus;
 }
 
-bool Application::handleAction(char button)
+bool Application::handleAction(u64 button)
 {
     View* hintParent = Application::currentFocus;
     std::set<Key> consumedKeys;
@@ -557,17 +532,10 @@ void Application::frame()
     frameContext.fontStash  = &Application::fontStash;
     frameContext.theme      = Application::getThemeValues();
 
+    dk.beginRender();
+
     nvgBeginFrame(Application::vg, Application::windowWidth, Application::windowHeight, frameContext.pixelRatio);
     nvgScale(Application::vg, Application::windowScale, Application::windowScale);
-
-    // GL Clear
-    glClearColor(
-        frameContext.theme->backgroundColor[0],
-        frameContext.theme->backgroundColor[1],
-        frameContext.theme->backgroundColor[2],
-        1.0f);
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     std::vector<View*> viewsToDraw;
 
@@ -598,16 +566,13 @@ void Application::frame()
     // End frame
     nvgResetTransform(Application::vg); // scale
     nvgEndFrame(Application::vg);
+
+    dk.endRender();
 }
 
 void Application::exit()
 {
     Application::clear();
-
-    if (Application::vg)
-        nvgDeleteGL3(Application::vg);
-
-    glfwTerminate();
 
     menu_animation_free();
 

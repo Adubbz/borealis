@@ -19,8 +19,6 @@
 
 #pragma once
 
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
 #include <nanovg.h>
 
 #include <borealis/animations.hpp>
@@ -100,7 +98,7 @@ class Application
 
     static void notify(std::string text);
 
-    static void onGamepadButtonPressed(char button, bool repeating);
+    static void onGamepadButtonPressed(u64 button, bool repeating);
 
     /**
       * "Crashes" the app (displays a fullscreen CrashFrame)
@@ -147,7 +145,6 @@ class Application
     static std::string getTitle();
 
   private:
-    inline static GLFWwindow* window;
     inline static NVGcontext* vg;
 
     inline static std::string title;
@@ -166,9 +163,6 @@ class Application
 
     inline static Theme currentTheme;
     inline static ThemeVariant currentThemeVariant;
-
-    inline static GLFWgamepadstate oldGamepad;
-    inline static GLFWgamepadstate gamepad;
 
     inline static Style currentStyle;
 
@@ -198,7 +192,7 @@ class Application
      * the given button
      * Returns true if at least one action has been fired
      */
-    static bool handleAction(char button);
+    static bool handleAction(u64 button);
 };
 
 } // namespace brls

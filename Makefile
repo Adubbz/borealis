@@ -67,7 +67,7 @@ CXXFLAGS	:= $(CFLAGS) -fno-exceptions -std=c++1z -O2
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lnanovg -lnx -lm
+LIBS	:= -lnanovg -ldeko3d -lnx -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
