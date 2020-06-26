@@ -145,6 +145,9 @@ class Application
     static std::string getTitle();
 
   private:
+    static constexpr size_t MaxButtons = 32;
+    inline static u8 buttons[MaxButtons];
+
     inline static NVGcontext* vg;
 
     inline static std::string title;
