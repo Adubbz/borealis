@@ -1,7 +1,7 @@
 mkfile_path	:=	$(abspath $(lastword $(MAKEFILE_LIST)))
 current_dir	:=	$(BOREALIS_PATH)/$(notdir $(patsubst %/,%,$(dir $(mkfile_path))))
 
-LIBS		:=	-lglfw3 -lEGL -lglapi -ldrm_nouveau -lm $(LIBS)
+LIBS		:=	-lglfw3 -lEGL -lglapi -ldrm_nouveau -ldeko3d -lm $(LIBS)
 
 SOURCES		:=	$(SOURCES) \
 				$(current_dir)/lib \
@@ -15,4 +15,5 @@ INCLUDES	:=	$(INCLUDES) \
 				$(current_dir)/include \
 				$(current_dir)/include/borealis/extern/glad \
 				$(current_dir)/include/borealis/extern/nanovg \
+				$(current_dir)/include/borealis/nanovg/framework \
 				$(current_dir)/include/borealis/extern/libretro-common

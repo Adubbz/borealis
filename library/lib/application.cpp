@@ -41,6 +41,7 @@
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 #define NANOVG_GL3_IMPLEMENTATION
+#define USE_OPENGL
 #include <nanovg_gl.h>
 
 #ifdef __SWITCH__
